@@ -87,6 +87,7 @@ ACPI_MODULE_NAME("utosi")
 static struct acpi_interface_info acpi_default_supported_interfaces[] = {
 	/* Operating System Vendor Strings */
 
+	{"Darwin", NULL, 0, ACPI_OSI_DARWIN},	/* OS X */
 	{"Windows 2000", NULL, 0, ACPI_OSI_WIN_2000},	/* Windows 2000 */
 	{"Windows 2001", NULL, 0, ACPI_OSI_WIN_XP},	/* Windows XP */
 	{"Windows 2001 SP1", NULL, 0, ACPI_OSI_WIN_XP_SP1},	/* Windows XP SP1 */

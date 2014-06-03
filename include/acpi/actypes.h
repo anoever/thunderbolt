@@ -1233,18 +1233,19 @@ struct acpi_memory_list {
 #define ACPI_ENABLE_ALL_FEATURE_STRINGS     (ACPI_ENABLE_INTERFACES | ACPI_FEATURE_STRINGS)
 #define ACPI_ENABLE_ALL_STRINGS             (ACPI_ENABLE_INTERFACES | ACPI_VENDOR_STRINGS | ACPI_FEATURE_STRINGS)
 
-#define ACPI_OSI_WIN_2000               0x01
-#define ACPI_OSI_WIN_XP                 0x02
-#define ACPI_OSI_WIN_XP_SP1             0x03
-#define ACPI_OSI_WINSRV_2003            0x04
-#define ACPI_OSI_WIN_XP_SP2             0x05
-#define ACPI_OSI_WINSRV_2003_SP1        0x06
-#define ACPI_OSI_WIN_VISTA              0x07
-#define ACPI_OSI_WINSRV_2008            0x08
-#define ACPI_OSI_WIN_VISTA_SP1          0x09
-#define ACPI_OSI_WIN_VISTA_SP2          0x0A
-#define ACPI_OSI_WIN_7                  0x0B
-#define ACPI_OSI_WIN_8                  0x0C
+#define ACPI_OSI_DARWIN                 0x01
+#define ACPI_OSI_WIN_2000               0x02
+#define ACPI_OSI_WIN_XP                 0x03
+#define ACPI_OSI_WIN_XP_SP1             0x04
+#define ACPI_OSI_WINSRV_2003            0x05
+#define ACPI_OSI_WIN_XP_SP2             0x06
+#define ACPI_OSI_WINSRV_2003_SP1        0x07
+#define ACPI_OSI_WIN_VISTA              0x08
+#define ACPI_OSI_WINSRV_2008            0x09
+#define ACPI_OSI_WIN_VISTA_SP1          0x0A
+#define ACPI_OSI_WIN_VISTA_SP2          0x0B
+#define ACPI_OSI_WIN_7                  0x0C
+#define ACPI_OSI_WIN_8                  0x0D
 
 /* Definitions of file IO */
 
