@@ -135,66 +135,75 @@ static struct tb_port *tb_find_unused_down_port(struct tb_switch *sw)
 }
 
 /**
- * tb_activate_pcie_devices() - scan for and activate PCIe devices
- *
- * This method is somewhat ad hoc. For now it only supports one device
- * per port and only devices at depth 1.
+ * tb_activate_pcie_devices() - activate the first pci device on a switch
  */
-static void tb_activate_pcie_devices(struct tb *tb)
+static void tb_activate_pcie_devices(struct tb_switch *sw)
 {
-	int i;
 	int cap;
 	u32 data;
-	struct tb_switch *sw;
 	struct tb_port *up_port;
 	struct tb_port *down_port;
 	struct tb_pci_tunnel *tunnel;
-	/* scan for pcie devices at depth 1*/
-	for (i = 1; i <= tb->root_switch->config.max_port_number; i++) {
-		if (tb_is_upstream_port(&tb->root_switch->ports[i]))
-			continue;
-		if (tb->root_switch->ports[i].config.type != TB_TYPE_PORT)
-			continue;
-		if (!tb->root_switch->ports[i].remote)
-			continue;
-		sw = tb->root_switch->ports[i].remote->sw;
-		up_port = tb_find_pci_up_port(sw);
-		if (!up_port) {
-			tb_sw_info(sw, "no PCIe devices found, aborting\n");
-			continue;
-		}
+	struct tb_switch *upstream_sw = tb_upstream_switch(sw);
+	if (!upstream_sw) {
+		tb_sw_WARN(sw, "Cannot activate devices on root switch\n");
+		return;
+	}
+	/* find pci up port for sw */
+	up_port = tb_find_pci_up_port(sw);
+	if (!up_port) {
+		tb_sw_info(sw, "no PCIe devices found, aborting\n");
+		return;
+	}
 
-		/* check whether port is already activated */
-		cap = tb_find_cap(up_port, TB_CFG_PORT, TB_CAP_PCIE);
-		if (cap <= 0)
-			continue;
-		if (tb_port_read(up_port, &data, TB_CFG_PORT, cap, 1))
-			continue;
-		if (data & 0x80000000) {
-			tb_port_info(up_port,
-				     "PCIe port already activated, aborting\n");
-			continue;
-		}
+	/* check whether port is already activated */
+	cap = tb_find_cap(up_port, TB_CFG_PORT, TB_CAP_PCIE);
+	if (cap <= 0)
+		return;
+	if (tb_port_read(up_port, &data, TB_CFG_PORT, cap, 1))
+		return;
+	if (data & 0x80000000) {
+		tb_port_info(up_port,
+			     "PCIe port already activated, aborting\n");
+		return;
+	}
 
-		down_port = tb_find_unused_down_port(tb->root_switch);
-		if (!down_port) {
-			tb_port_info(up_port,
-				     "All PCIe down ports are occupied, aborting\n");
-			continue;
-		}
-		tunnel = tb_pci_alloc(tb, up_port, down_port);
-		if (!tunnel) {
-			tb_port_info(up_port,
-				     "PCIe tunnel allocation failed, aborting\n");
-			continue;
-		}
+	down_port = tb_find_unused_down_port(upstream_sw);
+	if (!down_port) {
+		tb_sw_info(upstream_sw,
+			   "All PCIe down ports are occupied, aborting\n");
+		return;
+	}
+	tunnel = tb_pci_alloc(sw->tb, up_port, down_port);
+	if (!tunnel) {
+		tb_port_info(up_port,
+			     "PCIe tunnel allocation failed, aborting\n");
+		return;
+	}
+	if (tb_pci_activate(tunnel)) {
+		tb_port_info(up_port,
+			     "PCIe tunnel activation failed, aborting\n");
+		tb_pci_free(tunnel);
+	}
+}
 
-		if (tb_pci_activate(tunnel)) {
-			tb_port_info(up_port,
-				     "PCIe tunnel activation failed, aborting\n");
-			tb_pci_free(tunnel);
-		}
+/**
+ * tb_activate_recursive() - activate all pci devices below sw
+ */
+static void tb_activate_recursive(struct tb_switch *sw) {
+	int i;
 
+	if (sw != sw->tb->root_switch)
+		tb_activate_pcie_devices(sw);
+
+	for (i = 1; i <= sw->config.max_port_number; i++) {
+		if (tb_is_upstream_port(&sw->ports[i]))
+			continue;
+		if (sw->ports[i].config.type != TB_TYPE_PORT)
+			continue;
+		if (!sw->ports[i].remote)
+			continue;
+		tb_activate_recursive(sw->ports[i].remote->sw);
 	}
 }
 
@@ -262,13 +271,10 @@ static void tb_handle_hotplug(struct work_struct *work)
 		tb_scan_port(port);
 		if (!port->remote) {
 			tb_port_info(port, "hotplug: no switch found\n");
-		} else if (port->remote->sw->config.depth > 1) {
-			tb_sw_warn(port->remote->sw,
-				   "hotplug: chaining not supported\n");
 		} else {
 			tb_sw_info(port->remote->sw,
 				   "hotplug: activating pcie devices\n");
-			tb_activate_pcie_devices(tb);
+			tb_activate_recursive(port->remote->sw);
 		}
 	}
 out:
@@ -382,7 +388,7 @@ struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi)
 
 	/* Full scan to discover devices added before the driver was loaded. */
 	tb_scan_switch(tb->root_switch);
-	tb_activate_pcie_devices(tb);
+	tb_activate_recursive(tb->root_switch);
 
 	/* Allow tb_handle_hotplug to progress events */
 	tb->hotplug_active = true;

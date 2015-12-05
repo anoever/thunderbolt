@@ -61,6 +61,13 @@ struct tb_pci_tunnel *tb_pci_alloc(struct tb *tb, struct tb_port *up,
 	struct tb_pci_tunnel *tunnel = kzalloc(sizeof(*tunnel), GFP_KERNEL);
 	if (!tunnel)
 		goto err;
+	if (down->sw != tb_upstream_switch(up->sw)) {
+		tb_WARN(tb,
+			"ports must be on adjacent switches (down: %llx:%x up: %llx:%x)\n",
+			tb_route(down->sw), down->port,
+			tb_route(up->sw), up->port);
+		goto err;
+	}
 	tunnel->tb = tb;
 	tunnel->down_port = down;
 	tunnel->up_port = up;
