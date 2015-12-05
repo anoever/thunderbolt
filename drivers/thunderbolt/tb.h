@@ -117,21 +117,6 @@ struct tb {
 
 /* helper functions & macros */
 
-/**
- * tb_upstream_port() - return the upstream port of a switch
- *
- * Every switch has an upstream port (for the root switch it is the NHI).
- *
- * During switch alloc/init tb_upstream_port()->remote may be NULL, even for
- * non root switches (on the NHI port remote is always NULL).
- *
- * Return: Returns the upstream port of the switch.
- */
-static inline struct tb_port *tb_upstream_port(struct tb_switch *sw)
-{
-	return &sw->ports[sw->config.upstream_port_number];
-}
-
 static inline u64 tb_route(struct tb_switch *sw)
 {
 	return ((u64) sw->config.route_hi) << 32 | sw->config.route_lo;
@@ -248,6 +233,30 @@ int tb_drom_read_uid_only(struct tb_switch *sw, u64 *uid);
 static inline int tb_route_length(u64 route)
 {
 	return (fls64(route) + TB_ROUTE_SHIFT - 1) / TB_ROUTE_SHIFT;
+}
+
+/**
+ * tb_upstream_port() - return the upstream port of a switch
+ *
+ * Every switch has an upstream port (for the root switch it is the NHI).
+ *
+ * During switch alloc/init tb_upstream_port()->remote may be NULL, even for
+ * non root switches (on the NHI port remote is always NULL).
+ *
+ * Return: Returns the upstream port of the switch.
+ */
+static inline struct tb_port *tb_upstream_port(struct tb_switch *sw)
+{
+	return &sw->ports[sw->config.upstream_port_number];
+}
+
+static inline struct tb_switch *tb_upstream_switch(struct tb_switch *sw) {
+	struct tb_port *port = tb_upstream_port(sw);
+	if (!port->remote) {
+		tb_sw_WARN(sw, "switch has no upstream switch (root switch?)");
+		return NULL;
+	}
+	return port->remote->sw;
 }
 
 static inline bool tb_is_upstream_port(struct tb_port *port)
