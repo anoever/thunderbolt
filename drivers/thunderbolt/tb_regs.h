@@ -23,15 +23,22 @@
  */
 #define TB_MAX_CONFIG_RW_LENGTH 60
 
-enum tb_cap {
-	TB_CAP_PHY		= 0x0001,
-	TB_CAP_TIME1		= 0x0003,
-	TB_CAP_PCIE		= 0x0004,
-	TB_CAP_I2C		= 0x0005,
-	TB_CAP_PLUG_EVENTS	= 0x0105, /* also EEPROM */
-	TB_CAP_TIME2		= 0x0305,
-	TB_CAP_IECS		= 0x0405,
-	TB_CAP_LINK_CONTROLLER	= 0x0605, /* also IECS */
+enum tb_switch_cap {
+	TB_SWITCH_CAP_VSEC		= 0x05,
+};
+
+enum tb_switch_vsec_cap {
+	TB_VSEC_CAP_PLUG_EVENTS		= 0x01, /* also EEPROM */
+	TB_VSEC_CAP_TIME2		= 0x03,
+	TB_VSEC_CAP_IECS		= 0x04,
+	TB_VSEC_CAP_LINK_CONTROLLER	= 0x06, /* also IECS */
+};
+
+enum tb_port_cap {
+	TB_PORT_CAP_PHY			= 0x01,
+	TB_PORT_CAP_TIME1		= 0x03,
+	TB_PORT_CAP_ADAP		= 0x04,
+	TB_PORT_CAP_VSEC		= 0x05,
 };
 
 enum tb_port_state {
@@ -51,13 +58,15 @@ struct tb_cap_basic {
 
 struct tb_cap_extended_short {
 	u8 next; /* if next and length are zero then we have a long cap */
-	enum tb_cap cap:16;
+	u8 cap;
+	u8 vsec_id;
 	u8 length;
 } __packed;
 
 struct tb_cap_extended_long {
 	u8 zero1;
-	enum tb_cap cap:16;
+	u8 cap;
+	u8 vsec_id;
 	u8 zero2;
 	u16 next;
 	u16 length;
