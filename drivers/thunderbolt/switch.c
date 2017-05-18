@@ -5,12 +5,473 @@
  */
 
 #include <linux/delay.h>
+#include <linux/idr.h>
+#include <linux/nvmem-provider.h>
+#include <linux/sizes.h>
 #include <linux/slab.h>
+#include <linux/vmalloc.h>
 
 #include "tb.h"
 
 /* Switch authorization from userspace is serialized by this lock */
 static DEFINE_MUTEX(switch_lock);
+
+/* Switch NVM support */
+
+#define NVM_DEVID		0x05
+#define NVM_VERSION		0x08
+#define NVM_CSS			0x10
+#define NVM_FLASH_SIZE		0x45
+
+#define NVM_MIN_SIZE		SZ_32K
+#define NVM_MAX_SIZE		SZ_512K
+
+static DEFINE_IDA(nvm_ida);
+
+struct nvm_auth_status {
+	struct list_head list;
+	uuid_be uuid;
+	u32 status;
+};
+
+/*
+ * Hold NVM authentication failure status per switch This information
+ * needs to stay around even when the switch gets power cycled so we
+ * keep it separately.
+ */
+static LIST_HEAD(nvm_auth_status_cache);
+static DEFINE_MUTEX(nvm_auth_status_lock);
+
+static struct nvm_auth_status *__nvm_get_auth_status(const struct tb_switch *sw)
+{
+	struct nvm_auth_status *st;
+
+	list_for_each_entry(st, &nvm_auth_status_cache, list) {
+		if (!uuid_be_cmp(st->uuid, *sw->uuid))
+			return st;
+	}
+
+	return NULL;
+}
+
+static void nvm_get_auth_status(const struct tb_switch *sw, u32 *status)
+{
+	struct nvm_auth_status *st;
+
+	mutex_lock(&nvm_auth_status_lock);
+	st = __nvm_get_auth_status(sw);
+	mutex_unlock(&nvm_auth_status_lock);
+
+	*status = st ? st->status : 0;
+}
+
+static void nvm_set_auth_status(const struct tb_switch *sw, u32 status)
+{
+	struct nvm_auth_status *st;
+
+	if (WARN_ON(!sw->uuid))
+		return;
+
+	mutex_lock(&nvm_auth_status_lock);
+	st = __nvm_get_auth_status(sw);
+
+	if (!st) {
+		st = kzalloc(sizeof(*st), GFP_KERNEL);
+		if (!st)
+			goto unlock;
+
+		memcpy(&st->uuid, sw->uuid, sizeof(st->uuid));
+		INIT_LIST_HEAD(&st->list);
+		list_add_tail(&st->list, &nvm_auth_status_cache);
+	}
+
+	st->status = status;
+unlock:
+	mutex_unlock(&nvm_auth_status_lock);
+}
+
+static void nvm_clear_auth_status(const struct tb_switch *sw)
+{
+	struct nvm_auth_status *st;
+
+	mutex_lock(&nvm_auth_status_lock);
+	st = __nvm_get_auth_status(sw);
+	if (st) {
+		list_del(&st->list);
+		kfree(st);
+	}
+	mutex_unlock(&nvm_auth_status_lock);
+}
+
+static int nvm_validate_and_write(struct tb_switch *sw)
+{
+	unsigned int image_size, hdr_size;
+	const u8 *buf = sw->nvm->buf;
+	u16 ds_size;
+	int ret;
+
+	if (!buf)
+		return -EINVAL;
+
+	image_size = sw->nvm->buf_data_size;
+	if (image_size < NVM_MIN_SIZE || image_size > NVM_MAX_SIZE)
+		return -EINVAL;
+
+	/*
+	 * FARB pointer must point inside the image and must at least
+	 * contain parts of the digital section we will be reading here.
+	 */
+	hdr_size = (*(u32 *)buf) & 0xffffff;
+	if (hdr_size + NVM_DEVID + 2 >= image_size)
+		return -EINVAL;
+
+	/* Digital section start should be aligned to 4k page */
+	if (!IS_ALIGNED(hdr_size, SZ_4K))
+		return -EINVAL;
+
+	/*
+	 * Read digital section size and check that it also fits inside
+	 * the image.
+	 */
+	ds_size = *(u16 *)(buf + hdr_size);
+	if (ds_size >= image_size)
+		return -EINVAL;
+
+	if (!sw->safe_mode) {
+		u16 device_id;
+
+		/*
+		 * Make sure the device ID in the image matches the one
+		 * we read from the switch config space.
+		 */
+		device_id = *(u16 *)(buf + hdr_size + NVM_DEVID);
+		if (device_id != sw->config.device_id)
+			return -EINVAL;
+
+		if (sw->generation < 3) {
+			/* Write CSS headers first */
+			ret = dma_port_flash_write(sw->dma_port,
+				DMA_PORT_CSS_ADDRESS, buf + NVM_CSS,
+				DMA_PORT_CSS_MAX_SIZE);
+			if (ret)
+				return ret;
+		}
+
+		/* Skip headers in the image */
+		buf += hdr_size;
+		image_size -= hdr_size;
+	}
+
+	return dma_port_flash_write(sw->dma_port, 0, buf, image_size);
+}
+
+static int nvm_authenticate_host(struct tb_switch *sw)
+{
+	int ret;
+
+	/*
+	 * Root switch NVM upgrade requires that we disconnect the
+	 * existing PCIe paths first (in case it is not in safe mode
+	 * already).
+	 */
+	if (!sw->safe_mode) {
+		ret = tb_domain_disconnect_pcie_paths(sw->tb);
+		if (ret)
+			return ret;
+		/*
+		 * The host controller goes away pretty soon after this if
+		 * everything goes well so getting timeout is expected.
+		 */
+		ret = dma_port_flash_update_auth(sw->dma_port);
+		return ret == -ETIMEDOUT ? 0 : ret;
+	}
+
+	/*
+	 * From safe mode we can get out by just power cycling the
+	 * switch.
+	 */
+	dma_port_power_cycle(sw->dma_port);
+	return 0;
+}
+
+static int nvm_authenticate_device(struct tb_switch *sw)
+{
+	int ret, retries = 10;
+
+	ret = dma_port_flash_update_auth(sw->dma_port);
+	if (ret && ret != -ETIMEDOUT)
+		return ret;
+
+	/*
+	 * Poll here for the authentication status. It takes some time
+	 * for the device to respond (we get timeout for a while). Once
+	 * we get response the device needs to be power cycled in order
+	 * to the new NVM to be taken into use.
+	 */
+	do {
+		u32 status;
+
+		ret = dma_port_flash_update_auth_status(sw->dma_port, &status);
+		if (ret < 0 && ret != -ETIMEDOUT)
+			return ret;
+		if (ret > 0) {
+			if (status) {
+				tb_sw_warn(sw, "failed to authenticate NVM\n");
+				nvm_set_auth_status(sw, status);
+			}
+
+			tb_sw_info(sw, "power cycling the switch now\n");
+			dma_port_power_cycle(sw->dma_port);
+			return 0;
+		}
+
+		msleep(500);
+	} while (--retries);
+
+	return -ETIMEDOUT;
+}
+
+static ssize_t nvm_authenticate_show(struct device *dev,
+	struct device_attribute *attr, char *buf)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+	u32 status;
+
+	nvm_get_auth_status(sw, &status);
+	return sprintf(buf, "%#x\n", status);
+}
+
+static ssize_t nvm_authenticate_store(struct device *dev,
+	struct device_attribute *attr, const char *buf, size_t count)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+	unsigned int val;
+	int ret;
+
+	if (mutex_lock_interruptible(&switch_lock))
+		return -ERESTARTSYS;
+
+	ret = kstrtouint(buf, 0, &val);
+	if (ret)
+		goto unlock;
+
+	switch (val) {
+	case 0:
+		/* Just clear the authentication status */
+		nvm_clear_auth_status(sw);
+		break;
+
+	case 1:
+		ret = nvm_validate_and_write(sw);
+		if (ret)
+			goto unlock;
+
+		sw->nvm->authenticating = true;
+
+		if (!tb_route(sw))
+			ret = nvm_authenticate_host(sw);
+		else
+			ret = nvm_authenticate_device(sw);
+		break;
+
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+unlock:
+	mutex_unlock(&switch_lock);
+
+	if (ret)
+		return ret;
+	return count;
+}
+static DEVICE_ATTR_RW(nvm_authenticate);
+
+static ssize_t nvm_version_show(struct device *dev,
+				struct device_attribute *attr, char *buf)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+
+	if (sw->safe_mode)
+		return -ENODATA;
+	return sprintf(buf, "%x.%x\n", sw->nvm->major, sw->nvm->minor);
+}
+static DEVICE_ATTR_RO(nvm_version);
+
+static struct attribute *nvm_attrs[] = {
+	&dev_attr_nvm_authenticate.attr,
+	&dev_attr_nvm_version.attr,
+	NULL,
+};
+
+static struct attribute_group nvm_group = {
+	.attrs = nvm_attrs,
+};
+
+static int tb_switch_nvm_read(void *priv, unsigned int offset, void *val,
+			      size_t bytes)
+{
+	struct tb_switch *sw = priv;
+
+	return dma_port_flash_read(sw->dma_port, offset, val, bytes);
+}
+
+static int tb_switch_nvm_write(void *priv, unsigned int offset, void *val,
+			       size_t bytes)
+{
+	struct tb_switch *sw = priv;
+	int ret = 0;
+
+	if (mutex_lock_interruptible(&switch_lock))
+		return -ERESTARTSYS;
+
+	/*
+	 * Since writing the NVM image might require some special steps,
+	 * for example when CSS headers are written, we cache the image
+	 * locally here and handle the special cases when the user asks
+	 * us to authenticate the image.
+	 */
+	if (!sw->nvm->buf) {
+		sw->nvm->buf = vmalloc(NVM_MAX_SIZE);
+		if (!sw->nvm->buf) {
+			ret = -ENOMEM;
+			goto unlock;
+		}
+	}
+
+	sw->nvm->buf_data_size = offset + bytes;
+	memcpy(sw->nvm->buf + offset, val, bytes);
+
+unlock:
+	mutex_unlock(&switch_lock);
+
+	return ret;
+}
+
+static struct nvmem_device *register_nvmem(struct tb_switch *sw, int id,
+					   size_t size, bool active)
+{
+	struct nvmem_config config;
+
+	memset(&config, 0, sizeof(config));
+
+	if (active) {
+		config.name = "nvm_active";
+		config.reg_read = tb_switch_nvm_read;
+	} else {
+		config.name = "nvm_non_active";
+		config.reg_write = tb_switch_nvm_write;
+	}
+
+	config.id = id;
+	config.stride = 4;
+	config.word_size = 4;
+	config.size = size;
+	config.dev = &sw->dev;
+	config.owner = THIS_MODULE;
+	config.root_only = true;
+	config.priv = sw;
+
+	return nvmem_register(&config);
+}
+
+static int tb_switch_nvm_add(struct tb_switch *sw)
+{
+	struct nvmem_device *nvm_dev;
+	struct tb_switch_nvm *nvm;
+	u32 val;
+	int ret;
+
+	if (!sw->dma_port)
+		return 0;
+
+	nvm = kzalloc(sizeof(*nvm), GFP_KERNEL);
+	if (!nvm)
+		return -ENOMEM;
+
+	nvm->id = ida_simple_get(&nvm_ida, 0, 0, GFP_KERNEL);
+
+	/*
+	 * If the switch is in safe-mode the only accessible portion of
+	 * the NVM is the non-active one where userspace is expected to
+	 * write new functional NVM.
+	 */
+	if (!sw->safe_mode) {
+		u32 nvm_size, hdr_size;
+
+		ret = dma_port_flash_read(sw->dma_port, NVM_FLASH_SIZE, &val,
+					  sizeof(val));
+		if (ret)
+			goto err_ida;
+
+		hdr_size = sw->generation < 3 ? SZ_8K : SZ_16K;
+		nvm_size = (SZ_1M << (val & 7)) / 8;
+		nvm_size = (nvm_size - hdr_size) / 2;
+
+		ret = dma_port_flash_read(sw->dma_port, NVM_VERSION, &val,
+					  sizeof(val));
+		if (ret)
+			goto err_ida;
+
+		nvm->major = val >> 16 & 0xff;
+		nvm->minor = val >> 8 & 0xff;
+
+		nvm_dev = register_nvmem(sw, nvm->id, nvm_size, true);
+		if (IS_ERR(nvm_dev)) {
+			ret = PTR_ERR(nvm_dev);
+			goto err_ida;
+		}
+		nvm->active = nvm_dev;
+	}
+
+	nvm_dev = register_nvmem(sw, nvm->id, NVM_MAX_SIZE, false);
+	if (IS_ERR(nvm_dev)) {
+		ret = PTR_ERR(nvm_dev);
+		goto err_nvm_active;
+	}
+	nvm->non_active = nvm_dev;
+
+	sw->nvm = nvm;
+
+	ret = sysfs_create_group(&sw->dev.kobj, &nvm_group);
+	if (ret) {
+		sw->nvm = NULL;
+		goto err_nvm_nonactive;
+	}
+
+	return 0;
+
+err_nvm_nonactive:
+	nvmem_unregister(nvm->non_active);
+err_nvm_active:
+	if (nvm->active)
+		nvmem_unregister(nvm->active);
+err_ida:
+	ida_simple_remove(&nvm_ida, nvm->id);
+	kfree(nvm);
+
+	return ret;
+}
+
+static void tb_switch_nvm_remove(struct tb_switch *sw)
+{
+	if (!sw->nvm)
+		return;
+
+	/* Remove authentication status in case the switch is unplugged */
+	if (!sw->nvm->authenticating)
+		nvm_clear_auth_status(sw);
+
+	sysfs_remove_group(&sw->dev.kobj, &nvm_group);
+	nvmem_unregister(sw->nvm->non_active);
+	if (sw->nvm->active)
+		nvmem_unregister(sw->nvm->active);
+	ida_simple_remove(&nvm_ida, sw->nvm->id);
+	vfree(sw->nvm->buf);
+	kfree(sw->nvm);
+	sw->nvm = NULL;
+}
 
 /* port utility functions */
 
@@ -617,6 +1078,44 @@ err:
 }
 
 /**
+ * tb_switch_alloc_safe_mode() - allocate a switch that is in safe mode
+ * @tb: Pointer to the owning domain
+ * @parent: Parent device for this switch
+ * @route: Route string for this switch
+ *
+ * This creates a switch in safe mode. This means the switch pretty much
+ * lacks all capabilities except DMA configuration port before it is
+ * flashed with a valid NVM firmware.
+ *
+ * The returned switch must be released by calling tb_switch_put().
+ *
+ * Return: Pointer to the allocated switch or %NULL in case of failure
+ */
+struct tb_switch *
+tb_switch_alloc_safe_mode(struct tb *tb, struct device *parent, u64 route)
+{
+	struct tb_switch *sw;
+
+	sw = kzalloc(sizeof(*sw), GFP_KERNEL);
+	if (!sw)
+		return NULL;
+
+	sw->tb = tb;
+	sw->config.depth = tb_route_length(route);
+	sw->config.route_hi = upper_32_bits(route);
+	sw->config.route_lo = lower_32_bits(route);
+	sw->safe_mode = true;
+
+	device_initialize(&sw->dev);
+	sw->dev.parent = parent;
+	sw->dev.bus = &tb_bus_type;
+	sw->dev.type = &tb_switch_type;
+	dev_set_name(&sw->dev, "%u-%llx", tb->index, tb_route(sw));
+
+	return sw;
+}
+
+/**
  * tb_switch_configure() - Uploads configuration to the switch
  * @sw: Switch to configure
  *
@@ -696,8 +1195,11 @@ static void tb_switch_set_uuid(struct tb_switch *sw)
 	sw->uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
 }
 
-static void tb_switch_add_dma_port(struct tb_switch *sw)
+static int tb_switch_add_dma_port(struct tb_switch *sw)
 {
+	u32 status;
+	int ret;
+
 	switch (sw->generation) {
 	case 3:
 		break;
@@ -705,14 +1207,49 @@ static void tb_switch_add_dma_port(struct tb_switch *sw)
 	case 2:
 		/* Only root switch can be upgraded */
 		if (tb_route(sw))
-			return;
+			return 0;
 		break;
 
 	default:
-		return;
+		/*
+		 * DMA port is the only thing available when the switch
+		 * is in safe mode.
+		 */
+		if (!sw->safe_mode)
+			return 0;
+		break;
 	}
 
+	if (sw->no_nvm_upgrade)
+		return 0;
+
 	sw->dma_port = dma_port_alloc(sw);
+	if (!sw->dma_port)
+		return 0;
+
+	/*
+	 * Check status of the previous flash authentication. If there
+	 * is one we need to power cycle the switch in any case to make
+	 * it functional again.
+	 */
+	ret = dma_port_flash_update_auth_status(sw->dma_port, &status);
+	if (ret <= 0)
+		return ret;
+
+	if (status) {
+		tb_sw_info(sw, "switch flash authentication failed\n");
+		tb_switch_set_uuid(sw);
+		nvm_set_auth_status(sw, status);
+	}
+
+	tb_sw_info(sw, "power cycling the switch now\n");
+	dma_port_power_cycle(sw->dma_port);
+
+	/*
+	 * We return error here which causes the switch adding failure.
+	 * It should appear back after power cycle is complete.
+	 */
+	return -ESHUTDOWN;
 }
 
 /**
@@ -738,34 +1275,43 @@ int tb_switch_add(struct tb_switch *sw)
 	 * to the userspace. NVM can be accessed through DMA
 	 * configuration based mailbox.
 	 */
-	tb_switch_add_dma_port(sw);
-
-	/* read drom */
-	ret = tb_drom_read(sw);
-	if (ret) {
-		tb_sw_warn(sw, "tb_eeprom_read_rom failed\n");
+	ret = tb_switch_add_dma_port(sw);
+	if (ret)
 		return ret;
-	}
-	tb_sw_info(sw, "uid: %#llx\n", sw->uid);
 
-	tb_switch_set_uuid(sw);
-
-	for (i = 0; i <= sw->config.max_port_number; i++) {
-		if (sw->ports[i].disabled) {
-			tb_port_info(&sw->ports[i], "disabled by eeprom\n");
-			continue;
-		}
-		ret = tb_init_port(&sw->ports[i]);
-		if (ret)
+	if (!sw->safe_mode) {
+		/* read drom */
+		ret = tb_drom_read(sw);
+		if (ret) {
+			tb_sw_warn(sw, "tb_eeprom_read_rom failed\n");
 			return ret;
+		}
+		tb_sw_info(sw, "uid: %#llx\n", sw->uid);
+
+		tb_switch_set_uuid(sw);
+
+		for (i = 0; i <= sw->config.max_port_number; i++) {
+			if (sw->ports[i].disabled) {
+				tb_port_info(&sw->ports[i], "disabled by eeprom\n");
+				continue;
+			}
+			ret = tb_init_port(&sw->ports[i]);
+			if (ret)
+				return ret;
+		}
+
+		if (sw->security_level == TB_SECURITY_SECURE)
+			sw->dev.groups = secure_switch_groups;
+		else
+			sw->dev.groups = switch_groups;
 	}
 
-	if (sw->security_level == TB_SECURITY_SECURE)
-		sw->dev.groups = secure_switch_groups;
-	else
-		sw->dev.groups = switch_groups;
+	ret = device_add(&sw->dev);
+	if (ret)
+		return ret;
 
-	return device_add(&sw->dev);
+	tb_switch_nvm_add(sw);
+	return 0;
 }
 
 /**
@@ -792,6 +1338,7 @@ void tb_switch_remove(struct tb_switch *sw)
 	if (!sw->is_unplugged)
 		tb_plug_events_active(sw, false);
 
+	tb_switch_nvm_remove(sw);
 	device_unregister(&sw->dev);
 }
 
