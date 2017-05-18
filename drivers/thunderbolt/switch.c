@@ -382,6 +382,28 @@ struct device_type tb_switch_type = {
 	.release = tb_switch_release,
 };
 
+static void tb_switch_set_generation(struct tb_switch *sw)
+{
+	switch (sw->config.device_id) {
+	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_LP_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_2C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_4C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_2C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_ALPINE_RIDGE_C_4C_BRIDGE:
+		sw->generation = 3;
+		break;
+
+	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_BRIDGE:
+	case PCI_DEVICE_ID_INTEL_FALCON_RIDGE_4C_BRIDGE:
+		sw->generation = 2;
+		break;
+
+	default:
+		sw->generation = 1;
+		break;
+	}
+}
+
 /**
  * tb_switch_alloc() - allocate a switch
  * @tb: Pointer to the owning domain
@@ -441,6 +463,8 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, struct device *parent,
 		goto err;
 	}
 	sw->cap_plug_events = cap;
+
+	tb_switch_set_generation(sw);
 
 	device_initialize(&sw->dev);
 	sw->dev.parent = parent;
