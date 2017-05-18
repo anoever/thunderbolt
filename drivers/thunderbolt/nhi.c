@@ -21,6 +21,12 @@
 
 #define RING_TYPE(ring) ((ring)->is_tx ? "TX ring" : "RX ring")
 
+/*
+ * Minimal number of vectors when we use MSI-X. Two for control channel
+ * Rx/Tx and the rest four are for cross domain DMA paths.
+ */
+#define MSIX_MIN_VECS		6
+#define MSIX_MAX_VECS		16
 
 static int ring_interrupt_index(struct tb_ring *ring)
 {
@@ -239,8 +245,82 @@ int __ring_enqueue(struct tb_ring *ring, struct ring_frame *frame)
 	return ret;
 }
 
+static irqreturn_t ring_msix(int irq, void *data)
+{
+	struct tb_ring *ring = data;
+
+	schedule_work(&ring->work);
+	return IRQ_HANDLED;
+}
+
+static void ring_map_unmap_msix(struct tb_ring *ring, bool map)
+{
+	u32 step, shift, ivr, misc;
+	int index;
+
+	if (ring->irq <= 0)
+		return;
+
+	if (ring->is_tx)
+		index = ring->hop;
+	else
+		index = ring->hop + ring->nhi->hop_count;
+
+	/*
+	 * Ask the hardware to clear interrupt status bits automatically
+	 * since we already know which interrupt was triggered.
+	 */
+	misc = ioread32(ring->nhi->iobase + REG_DMA_MISC);
+	if (!(misc & REG_DMA_MISC_INT_AUTO_CLEAR)) {
+		misc |= REG_DMA_MISC_INT_AUTO_CLEAR;
+		iowrite32(misc, ring->nhi->iobase + REG_DMA_MISC);
+	}
+
+	step = index / REG_INT_VEC_ALLOC_REGS * REG_INT_VEC_ALLOC_BITS;
+	shift = index % REG_INT_VEC_ALLOC_REGS * REG_INT_VEC_ALLOC_BITS;
+	ivr = ioread32(ring->nhi->iobase + REG_INT_VEC_ALLOC_BASE + step);
+	ivr &= ~(REG_INT_VEC_ALLOC_MASK << shift);
+	if (map)
+		ivr |= ring->vector << shift;
+	iowrite32(ivr, ring->nhi->iobase + REG_INT_VEC_ALLOC_BASE + step);
+}
+
+static int ring_request_msix(struct tb_ring *ring, bool no_suspend)
+{
+	struct tb_nhi *nhi = ring->nhi;
+	unsigned long irqflags;
+	int ret;
+
+	if (!nhi->pdev->msix_enabled)
+		return 0;
+
+	ret = ida_simple_get(&nhi->msix_ida, 0, MSIX_MAX_VECS, GFP_KERNEL);
+	if (ret < 0)
+		return ret;
+
+	ring->vector = ret;
+
+	ring->irq = pci_irq_vector(ring->nhi->pdev, ring->vector);
+	if (ring->irq < 0)
+		return ring->irq;
+
+	irqflags = no_suspend ? IRQF_NO_SUSPEND : 0;
+	return request_irq(ring->irq, ring_msix, irqflags, "thunderbolt", ring);
+}
+
+static void ring_release_msix(struct tb_ring *ring)
+{
+	if (ring->irq <= 0)
+		return;
+
+	free_irq(ring->irq, ring);
+	ida_simple_remove(&ring->nhi->msix_ida, ring->vector);
+	ring->vector = 0;
+	ring->irq = 0;
+}
+
 static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
-				  bool transmit)
+				  bool transmit, unsigned int flags)
 {
 	struct tb_ring *ring = NULL;
 	dev_info(&nhi->pdev->dev, "allocating %s ring %d of size %d\n",
@@ -271,9 +351,14 @@ static struct tb_ring *ring_alloc(struct tb_nhi *nhi, u32 hop, int size,
 	ring->hop = hop;
 	ring->is_tx = transmit;
 	ring->size = size;
+	ring->flags = flags;
 	ring->head = 0;
 	ring->tail = 0;
 	ring->running = false;
+
+	if (ring_request_msix(ring, flags & RING_FLAG_NO_SUSPEND))
+		goto err;
+
 	ring->descriptors = dma_alloc_coherent(&ring->nhi->pdev->dev,
 			size * sizeof(*ring->descriptors),
 			&ring->descriptors_dma, GFP_KERNEL | __GFP_ZERO);
@@ -295,14 +380,16 @@ err:
 	return NULL;
 }
 
-struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size)
+struct tb_ring *ring_alloc_tx(struct tb_nhi *nhi, int hop, int size,
+			      unsigned int flags)
 {
-	return ring_alloc(nhi, hop, size, true);
+	return ring_alloc(nhi, hop, size, true, flags);
 }
 
-struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size)
+struct tb_ring *ring_alloc_rx(struct tb_nhi *nhi, int hop, int size,
+			      unsigned int flags)
 {
-	return ring_alloc(nhi, hop, size, false);
+	return ring_alloc(nhi, hop, size, false, flags);
 }
 
 /**
@@ -334,6 +421,7 @@ void ring_start(struct tb_ring *ring)
 		ring_iowrite32options(ring,
 				      RING_FLAG_ENABLE | RING_FLAG_RAW, 0);
 	}
+	ring_map_unmap_msix(ring, true);
 	ring_interrupt_active(ring, true);
 	ring->running = true;
 err:
@@ -366,6 +454,7 @@ void ring_stop(struct tb_ring *ring)
 		goto err;
 	}
 	ring_interrupt_active(ring, false);
+	ring_map_unmap_msix(ring, false);
 
 	ring_iowrite32options(ring, 0, 0);
 	ring_iowrite64desc(ring, 0, 0);
@@ -412,6 +501,8 @@ void ring_free(struct tb_ring *ring)
 		dev_WARN(&ring->nhi->pdev->dev, "%s %d still running\n",
 			 RING_TYPE(ring), ring->hop);
 	}
+
+	ring_release_msix(ring);
 
 	dma_free_coherent(&ring->nhi->pdev->dev,
 			  ring->size * sizeof(*ring->descriptors),
@@ -528,9 +619,51 @@ static void nhi_shutdown(struct tb_nhi *nhi)
 	 * We have to release the irq before calling flush_work. Otherwise an
 	 * already executing IRQ handler could call schedule_work again.
 	 */
-	devm_free_irq(&nhi->pdev->dev, nhi->pdev->irq, nhi);
+	if (!nhi->pdev->msix_enabled)
+		devm_free_irq(&nhi->pdev->dev, nhi->pdev->irq, nhi);
 	flush_work(&nhi->interrupt_work);
 	mutex_destroy(&nhi->lock);
+	ida_destroy(&nhi->msix_ida);
+}
+
+static int nhi_init_msi(struct tb_nhi *nhi)
+{
+	struct pci_dev *pdev = nhi->pdev;
+	int res, irq, nvec;
+
+	/* In case someone left them on. */
+	nhi_disable_interrupts(nhi);
+
+	ida_init(&nhi->msix_ida);
+
+	/*
+	 * The NHI has 16 MSI-X vectors or a single MSI. We first try to
+	 * get all MSI-X vectors and if we succeed, each ring will have
+	 * one MSI-X. If for some reason that does not work out, we
+	 * fallback to a single MSI.
+	 */
+	nvec = pci_alloc_irq_vectors(pdev, MSIX_MIN_VECS, MSIX_MAX_VECS,
+				     PCI_IRQ_MSIX);
+	if (nvec < 0) {
+		nvec = pci_alloc_irq_vectors(pdev, 1, 1, PCI_IRQ_MSI);
+		if (nvec < 0)
+			return nvec;
+
+		INIT_WORK(&nhi->interrupt_work, nhi_interrupt_work);
+
+		irq = pci_irq_vector(nhi->pdev, 0);
+		if (irq < 0)
+			return irq;
+
+		res = devm_request_irq(&pdev->dev, irq, nhi_msi,
+				       IRQF_NO_SUSPEND, "thunderbolt", nhi);
+		if (res) {
+			dev_err(&pdev->dev, "request_irq failed, aborting\n");
+			return res;
+		}
+	}
+
+	return 0;
 }
 
 static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
@@ -542,12 +675,6 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	res = pcim_enable_device(pdev);
 	if (res) {
 		dev_err(&pdev->dev, "cannot enable PCI device, aborting\n");
-		return res;
-	}
-
-	res = pci_enable_msi(pdev);
-	if (res) {
-		dev_err(&pdev->dev, "cannot enable MSI, aborting\n");
 		return res;
 	}
 
@@ -568,7 +695,6 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (nhi->hop_count != 12 && nhi->hop_count != 32)
 		dev_warn(&pdev->dev, "unexpected hop count: %d\n",
 			 nhi->hop_count);
-	INIT_WORK(&nhi->interrupt_work, nhi_interrupt_work);
 
 	nhi->tx_rings = devm_kcalloc(&pdev->dev, nhi->hop_count,
 				     sizeof(*nhi->tx_rings), GFP_KERNEL);
@@ -577,12 +703,9 @@ static int nhi_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	if (!nhi->tx_rings || !nhi->rx_rings)
 		return -ENOMEM;
 
-	nhi_disable_interrupts(nhi); /* In case someone left them on. */
-	res = devm_request_irq(&pdev->dev, pdev->irq, nhi_msi,
-			       IRQF_NO_SUSPEND, /* must work during _noirq */
-			       "thunderbolt", nhi);
+	res = nhi_init_msi(nhi);
 	if (res) {
-		dev_err(&pdev->dev, "request_irq failed, aborting\n");
+		dev_err(&pdev->dev, "cannot enable MSI, aborting\n");
 		return res;
 	}
 
