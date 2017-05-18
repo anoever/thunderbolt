@@ -1,0 +1,20 @@
+What:		/sys/bus/thunderbolt/devices/.../device
+Date:		Sep 2017
+KernelVersion:	4.13
+Contact:	thunderbolt-software@lists.01.org
+Description:	This attribute contains id of this device extracted from
+		the device DROM.
+
+What:		/sys/bus/thunderbolt/devices/.../vendor
+Date:		Sep 2017
+KernelVersion:	4.13
+Contact:	thunderbolt-software@lists.01.org
+Description:	This attribute contains vendor id of this device extracted
+		from the device DROM.
+
+What:		/sys/bus/thunderbolt/devices/.../unique_id
+Date:		Sep 2017
+KernelVersion:	4.13
+Contact:	thunderbolt-software@lists.01.org
+Description:	This attribute contains unique id (UUID) of this device
+		extracted from the device DROM or hardware registers.

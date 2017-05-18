@@ -281,6 +281,9 @@ static int tb_plug_events_active(struct tb_switch *sw, bool active)
 	u32 data;
 	int res;
 
+	if (!sw->config.enabled)
+		return 0;
+
 	sw->config.plug_events_delay = 0xff;
 	res = tb_sw_write(sw, ((u32 *) &sw->config) + 4, TB_CFG_SWITCH, 4, 1);
 	if (res)
@@ -307,36 +310,71 @@ static int tb_plug_events_active(struct tb_switch *sw, bool active)
 			   sw->cap_plug_events + 1, 1);
 }
 
-
-/**
- * tb_switch_free() - free a tb_switch and all downstream switches
- */
-void tb_switch_free(struct tb_switch *sw)
+static ssize_t device_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
 {
-	int i;
-	/* port 0 is the switch itself and never has a remote */
-	for (i = 1; i <= sw->config.max_port_number; i++) {
-		if (tb_is_upstream_port(&sw->ports[i]))
-			continue;
-		if (sw->ports[i].remote)
-			tb_switch_free(sw->ports[i].remote->sw);
-		sw->ports[i].remote = NULL;
-	}
+	struct tb_switch *sw = tb_to_switch(dev);
 
-	if (!sw->is_unplugged)
-		tb_plug_events_active(sw, false);
+	return sprintf(buf, "%#x\n", sw->device);
+}
+static DEVICE_ATTR_RO(device);
 
+static ssize_t vendor_show(struct device *dev, struct device_attribute *attr,
+			   char *buf)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+
+	return sprintf(buf, "%#x\n", sw->vendor);
+}
+static DEVICE_ATTR_RO(vendor);
+
+static ssize_t unique_id_show(struct device *dev, struct device_attribute *attr,
+			      char *buf)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+
+	return sprintf(buf, "%pUb\n", sw->uuid);
+}
+static DEVICE_ATTR_RO(unique_id);
+
+static struct attribute *switch_attrs[] = {
+	&dev_attr_device.attr,
+	&dev_attr_vendor.attr,
+	&dev_attr_unique_id.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(switch);
+
+static void tb_switch_release(struct device *dev)
+{
+	struct tb_switch *sw = tb_to_switch(dev);
+
+	kfree(sw->uuid);
 	kfree(sw->ports);
 	kfree(sw->drom);
 	kfree(sw);
 }
 
+struct device_type tb_switch_type = {
+	.name = "thunderbolt_device",
+	.release = tb_switch_release,
+};
+
 /**
- * tb_switch_alloc() - allocate and initialize a switch
+ * tb_switch_alloc() - allocate a switch
+ * @tb: Pointer to the owning domain
+ * @parent: Parent device for this switch
+ * @route: Route string for this switch
  *
- * Return: Returns a NULL on failure.
+ * Allocates and initializes a switch. Will not upload configuration to
+ * the switch. For that you need to call tb_switch_configure()
+ * separately. The returned switch should be released by calling
+ * tb_switch_put().
+ *
+ * Return: Pointer to the allocated switch or %NULL in case of failure
  */
-struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
+struct tb_switch *tb_switch_alloc(struct tb *tb, struct device *parent,
+				  u64 route)
 {
 	int i;
 	int cap;
@@ -352,10 +390,8 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
 	sw->tb = tb;
 	if (tb_cfg_read(tb->ctl, &sw->config, route, 0, TB_CFG_SWITCH, 0, 5))
 		goto err;
-	tb_info(tb,
-		"initializing Switch at %#llx (depth: %d, up port: %d)\n",
-		route, tb_route_length(route), upstream_port);
-	tb_info(tb, "old switch config:\n");
+
+	tb_info(tb, "current switch config:\n");
 	tb_dump_switch(tb, &sw->config);
 
 	/* configure switch */
@@ -363,24 +399,7 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
 	sw->config.depth = tb_route_length(route);
 	sw->config.route_lo = route;
 	sw->config.route_hi = route >> 32;
-	sw->config.enabled = 1;
-	/* from here on we may use the tb_sw_* functions & macros */
-
-	if (sw->config.vendor_id != 0x8086)
-		tb_sw_warn(sw, "unknown switch vendor id %#x\n",
-			   sw->config.vendor_id);
-
-	if (sw->config.device_id != PCI_DEVICE_ID_INTEL_LIGHT_RIDGE &&
-	    sw->config.device_id != PCI_DEVICE_ID_INTEL_CACTUS_RIDGE_4C &&
-	    sw->config.device_id != PCI_DEVICE_ID_INTEL_PORT_RIDGE &&
-	    sw->config.device_id != PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_BRIDGE &&
-	    sw->config.device_id != PCI_DEVICE_ID_INTEL_FALCON_RIDGE_4C_BRIDGE)
-		tb_sw_warn(sw, "unsupported switch device id %#x\n",
-			   sw->config.device_id);
-
-	/* upload configuration */
-	if (tb_sw_write(sw, 1 + (u32 *) &sw->config, TB_CFG_SWITCH, 1, 3))
-		goto err;
+	sw->config.enabled = 0;
 
 	/* initialize ports */
 	sw->ports = kcalloc(sw->config.max_port_number + 1, sizeof(*sw->ports),
@@ -401,31 +420,152 @@ struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
 	}
 	sw->cap_plug_events = cap;
 
+	device_initialize(&sw->dev);
+	sw->dev.parent = parent;
+	sw->dev.bus = &tb_bus_type;
+	sw->dev.type = &tb_switch_type;
+	sw->dev.groups = switch_groups;
+	dev_set_name(&sw->dev, "%u-%llx", tb->index, tb_route(sw));
+
+	return sw;
+err:
+	kfree(sw->ports);
+	kfree(sw);
+	return NULL;
+}
+
+/**
+ * tb_switch_configure() - Uploads configuration to the switch
+ * @sw: Switch to configure
+ *
+ * Call this function before the switch is added to the system. It will
+ * upload configuration to the switch and makes it available for the
+ * connection manager to use.
+ *
+ * Return: %0 in case of success and negative errno in case of failure
+ */
+int tb_switch_configure(struct tb_switch *sw)
+{
+	struct tb *tb = sw->tb;
+	u64 route;
+	int ret;
+
+	route = tb_route(sw);
+	tb_info(tb,
+		"initializing Switch at %#llx (depth: %d, up port: %d)\n",
+		route, tb_route_length(route), sw->config.upstream_port_number);
+
+	if (sw->config.vendor_id != PCI_VENDOR_ID_INTEL)
+		tb_sw_warn(sw, "unknown switch vendor id %#x\n",
+			   sw->config.vendor_id);
+
+	if (sw->config.device_id != PCI_DEVICE_ID_INTEL_LIGHT_RIDGE &&
+	    sw->config.device_id != PCI_DEVICE_ID_INTEL_CACTUS_RIDGE_4C &&
+	    sw->config.device_id != PCI_DEVICE_ID_INTEL_PORT_RIDGE &&
+	    sw->config.device_id != PCI_DEVICE_ID_INTEL_FALCON_RIDGE_2C_BRIDGE &&
+	    sw->config.device_id != PCI_DEVICE_ID_INTEL_FALCON_RIDGE_4C_BRIDGE)
+		tb_sw_warn(sw, "unsupported switch device id %#x\n",
+			   sw->config.device_id);
+
+	sw->config.enabled = 1;
+
+	/* upload configuration */
+	ret = tb_sw_write(sw, 1 + (u32 *) &sw->config, TB_CFG_SWITCH, 1, 3);
+	if (ret)
+		return ret;
+
+	return tb_plug_events_active(sw, true);
+}
+
+static void tb_switch_set_uuid(struct tb_switch *sw)
+{
+	u32 uuid[4];
+	int cap;
+
+	if (sw->uuid)
+		return;
+
+	/*
+	 * By default the UUID will be based on UID where upper two
+	 * dwords are filled with ones.
+	 */
+	uuid[0] = sw->uid & 0xffffffff;
+	uuid[1] = (sw->uid >> 32) & 0xffffffff;
+	uuid[2] = 0xffffffff;
+	uuid[3] = 0xffffffff;
+
+	/*
+	 * The newer controllers include fused UUID as part of link
+	 * controller specific registers
+	 */
+	cap = tb_switch_find_vsec_cap(sw, TB_VSEC_CAP_LINK_CONTROLLER);
+	if (cap > 0)
+		tb_sw_read(sw, uuid, TB_CFG_SWITCH, cap + 3, 4);
+
+	sw->uuid = kmemdup(uuid, sizeof(uuid), GFP_KERNEL);
+}
+
+/**
+ * tb_switch_add() - Add a switch to the domain
+ * @sw: Switch to add
+ *
+ * This is the last step in adding switch to the domain. It will read
+ * identification information from DROM and initializes ports so that
+ * they can be used to connect other switches. The switch will be
+ * exposed to the userspace when this function successfully returns. To
+ * remove and release the switch, call tb_switch_remove().
+ *
+ * Return: %0 in case of success and negative errno in case of failure
+ */
+int tb_switch_add(struct tb_switch *sw)
+{
+	int i, ret;
+
 	/* read drom */
 	if (tb_drom_read(sw))
 		tb_sw_warn(sw, "tb_eeprom_read_rom failed, continuing\n");
 	tb_sw_info(sw, "uid: %#llx\n", sw->uid);
+
+	tb_switch_set_uuid(sw);
 
 	for (i = 0; i <= sw->config.max_port_number; i++) {
 		if (sw->ports[i].disabled) {
 			tb_port_info(&sw->ports[i], "disabled by eeprom\n");
 			continue;
 		}
-		if (tb_init_port(&sw->ports[i]))
-			goto err;
+		ret = tb_init_port(&sw->ports[i]);
+		if (ret)
+			return ret;
 	}
 
-	/* TODO: I2C, IECS, link controller */
+	return device_add(&sw->dev);
+}
 
-	if (tb_plug_events_active(sw, true))
-		goto err;
+/**
+ * tb_switch_remove() - Remove and release a switch
+ * @sw: Switch to remove
+ *
+ * This will remove the switch from the domain and release it after last
+ * reference count drops to zero. If there are switches connected below
+ * this switch, they will be removed as well.
+ */
+void tb_switch_remove(struct tb_switch *sw)
+{
+	int i;
 
-	return sw;
-err:
-	kfree(sw->ports);
-	kfree(sw->drom);
-	kfree(sw);
-	return NULL;
+	/* port 0 is the switch itself and never has a remote */
+	for (i = 1; i <= sw->config.max_port_number; i++) {
+		if (tb_is_upstream_port(&sw->ports[i]))
+			continue;
+		if (sw->ports[i].remote)
+			tb_switch_remove(sw->ports[i].remote->sw);
+		sw->ports[i].remote = NULL;
+	}
+
+	if (!sw->is_unplugged)
+		tb_plug_events_active(sw, false);
+
+	device_unregister(&sw->dev);
 }
 
 /**
