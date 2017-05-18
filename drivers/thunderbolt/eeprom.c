@@ -204,6 +204,11 @@ struct tb_drom_entry_header {
 	enum tb_drom_entry_type type:1;
 } __packed;
 
+struct tb_drom_entry_generic {
+	struct tb_drom_entry_header header;
+	u8 data[0];
+} __packed;
+
 struct tb_drom_entry_port {
 	/* BYTES 0-1 */
 	struct tb_drom_entry_header header;
@@ -304,6 +309,15 @@ static void tb_drom_parse_port_entry(struct tb_port *port,
 				&port->sw->ports[entry->dual_link_port_nr];
 }
 
+static void tb_drom_parse_generic_entry(struct tb_switch *sw,
+		struct tb_drom_entry_generic *entry)
+{
+	if (entry->header.index == 1)
+		sw->vendor_name = kstrdup((char *)entry->data, GFP_KERNEL);
+	else if (entry->header.index == 2)
+		sw->device_name = kstrdup((char *)entry->data, GFP_KERNEL);
+}
+
 static int tb_drom_parse_entry(struct tb_switch *sw,
 		struct tb_drom_entry_header *header)
 {
@@ -311,8 +325,15 @@ static int tb_drom_parse_entry(struct tb_switch *sw,
 	int res;
 	enum tb_port_type type;
 
-	if (header->type != TB_DROM_ENTRY_PORT)
+	switch (header->type) {
+	case TB_DROM_ENTRY_PORT:
+		break;
+	case TB_DROM_ENTRY_GENERIC:
+		tb_drom_parse_generic_entry(sw,
+			(struct tb_drom_entry_generic *)header);
+	default:
 		return 0;
+	}
 
 	port = &sw->ports[header->index];
 	port->disabled = header->port_disabled;
