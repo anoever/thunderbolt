@@ -404,6 +404,8 @@ void ring_start(struct tb_ring *ring)
 {
 	mutex_lock(&ring->nhi->lock);
 	mutex_lock(&ring->lock);
+	if (ring->nhi->going_away)
+		goto err;
 	if (ring->running) {
 		dev_WARN(&ring->nhi->pdev->dev, "ring already started\n");
 		goto err;
@@ -451,6 +453,8 @@ void ring_stop(struct tb_ring *ring)
 	mutex_lock(&ring->lock);
 	dev_info(&ring->nhi->pdev->dev, "stopping %s %d\n",
 		 RING_TYPE(ring), ring->hop);
+	if (ring->nhi->going_away)
+		goto err;
 	if (!ring->running) {
 		dev_WARN(&ring->nhi->pdev->dev, "%s %d already stopped\n",
 			 RING_TYPE(ring), ring->hop);
@@ -655,6 +659,16 @@ static int nhi_resume_noirq(struct device *dev)
 {
 	struct pci_dev *pdev = to_pci_dev(dev);
 	struct tb *tb = pci_get_drvdata(pdev);
+	u32 vid;
+
+	/*
+	 * Check that the device is still there. It may be that the user
+	 * unplugged last device which causes the host controller to go
+	 * away on PCs.
+	 */
+	pci_read_config_dword(pdev, PCI_VENDOR_ID, &vid);
+	if (vid == ~0)
+		tb->nhi->going_away = true;
 
 	return tb_domain_resume_noirq(tb);
 }
